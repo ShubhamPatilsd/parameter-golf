@@ -61,10 +61,12 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model: dim=512 to match baseline for convergence testing
-    # Set MODEL_DIM=768 once confirmed working to test the real bet
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    # Repeat the same num_layers blocks this many times in the forward pass.
+    # num_recurrent_repeats=1 = normal (no recurrence).
+    # num_recurrent_repeats=3 = 3x effective depth, same parameters, same compressed size.
+    num_recurrent_repeats = int(os.environ.get("NUM_RECURRENT_REPEATS", 1))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -263,6 +265,7 @@ class GPT(nn.Module):
     def __init__(self, args: Hyperparameters):
         super().__init__()
         self.logit_softcap = args.logit_softcap
+        self.num_recurrent_repeats = args.num_recurrent_repeats
         self.tok_emb = nn.Embedding(args.vocab_size, args.model_dim)
         self.num_encoder_layers = args.num_layers // 2
         self.num_decoder_layers = args.num_layers - self.num_encoder_layers
@@ -274,7 +277,6 @@ class GPT(nn.Module):
         ])
         self.final_norm = RMSNorm()
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=args.tied_embed_init_std)
-        # Zero-init output projections
         for b in self.blocks:
             nn.init.zeros_(b.attn.proj.weight)
             nn.init.zeros_(b.mlp.proj.weight)
@@ -282,14 +284,18 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
         x0 = x
-        skips = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Run the same blocks num_recurrent_repeats times.
+        # Each repeat: encoder half stores skips, decoder half consumes them.
+        # Skip connections are re-used across repeats (same weights).
+        for _ in range(self.num_recurrent_repeats):
+            skips = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         logits = F.linear(x, self.tok_emb.weight)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
@@ -568,7 +574,9 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     n_ternary = sum(p.numel() for name, p in model.named_parameters() if is_bitlinear_weight(name))
-    log(f"model_params:{n_params} ternary_params:{n_ternary} dim:{args.model_dim} layers:{args.num_layers}")
+    effective_layers = args.num_layers * args.num_recurrent_repeats
+    log(f"model_params:{n_params} ternary_params:{n_ternary} dim:{args.model_dim} "
+        f"layers:{args.num_layers} repeats:{args.num_recurrent_repeats} effective_layers:{effective_layers}")
     log(f"estimated_ternary_bytes:{n_ternary * 2 // 8:,} vs int8_bytes:{n_params:,}")
     log(f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} seq_len:{args.train_seq_len}")
 
