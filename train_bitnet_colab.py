@@ -144,10 +144,14 @@ class BitLinear(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.frozen = False  # set True after loading recovered ternary weights
         if bias:
             raise NotImplementedError("BitLinear does not support bias")
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.frozen:
+            # Weights are already exactly {-1,0,+1}*scale — use directly, no re-quantization
+            return F.linear(x, self.weight.to(x.dtype))
         w = self.weight.float()
         scale = w.abs().mean() + 1e-5
         w_norm = w / scale
@@ -673,6 +677,11 @@ def main():
         recovered_obj = pickle.loads(zlib.decompress(f.read()))
     recovered_state = dequantize_bitnet_state_dict_v2(recovered_obj)
     model.load_state_dict(recovered_state, strict=True)
+    # Freeze all BitLinear layers so forward() uses recovered weights directly
+    # without re-quantizing (weights are already exactly {-1,0,+1}*scale)
+    for m in model.modules():
+        if isinstance(m, BitLinear):
+            m.frozen = True
     torch.cuda.synchronize()
     q_val_loss, q_val_bpb = eval_val(args, compiled_model, device, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
     log(f"final_ternary_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f}")
