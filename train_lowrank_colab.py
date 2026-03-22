@@ -541,12 +541,12 @@ def main():
 
     # Count stored vs effective params
     n_stored = sum(p.numel() for p in model.parameters())
+    lowrank_modules = {id(m) for m in model.modules() if isinstance(m, LowRankLinear)}
+    lowrank_param_ids = {id(p) for m in model.modules() if isinstance(m, LowRankLinear) for p in m.parameters()}
     n_effective = sum(
         m.effective_params() for m in model.modules() if isinstance(m, LowRankLinear)
     ) + sum(
-        p.numel() for name, p in model.named_parameters()
-        if not any(isinstance(model.get_submodule(name.rsplit(".", 1)[0] if "." in name else name), LowRankLinear)
-                   for _ in [0])
+        p.numel() for p in model.parameters() if id(p) not in lowrank_param_ids
     )
 
     # Optimizer: A and B matrices via Muon, rest via Adam
